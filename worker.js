@@ -8,8 +8,6 @@ export default {
     }
 
     const roomId = parts[1];
-    const name = url.searchParams.get("name") || "Anonymous";
-
     const id = env.ROOMS.idFromName(roomId);
     const stub = env.ROOMS.get(id);
     return stub.fetch(request);
@@ -19,7 +17,6 @@ export default {
 export class Room {
   constructor(state) {
     this.state = state;
-    this.sessions = new Map();
   }
 
   async fetch(request) {
@@ -29,51 +26,63 @@ export class Room {
 
     const url = new URL(request.url);
     const name = url.searchParams.get("name") || "Anonymous";
-    const userId = url.searchParams.get("userId");
-    
-    for (const [id, session] of this.sessions) {
-      if (session.userId === userId) {
-        try { session.ws.close(1000, "Reconnecting"); } catch {}
-        this.sessions.delete(id);
+    const userId = url.searchParams.get("userId") || crypto.randomUUID();
+
+    for (const ws of this.state.getWebSockets()) {
+      const att = ws.deserializeAttachment();
+      if (att && att.userId === userId) {
+        try { ws.close(1000, "Reconnecting"); } catch {}
       }
     }
-    const [client, server] = Object.values(new WebSocketPair());
-    server.accept();
-    
-    const sessionId = crypto.randomUUID();
-    this.sessions.set(sessionId, { ws: server, name, userId });
 
-    this.broadcast({ type: "joined", user: name }, sessionId);
-    this.broadcast({
-      type: "members",
-      members: [...this.sessions.values()].map(s => s.name)
-    }, null);
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
 
-    server.addEventListener("message", evt => {
-      try {
-        const msg = JSON.parse(evt.data);
-        this.broadcast(msg, sessionId);
-      } catch {}
-    });
+    this.state.acceptWebSocket(server);
+    server.serializeAttachment({ name, userId });
 
-    server.addEventListener("close", () => {
-      this.sessions.delete(sessionId);
-      this.broadcast({ type: "left", user: name }, sessionId);
-      this.broadcast({
-        type: "members",
-        members: [...this.sessions.values()].map(s => s.name)
-      }, null);
-    });
+    this.broadcast({ type: "joined", user: name }, server);
+    this.broadcastMembers();
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  broadcast(msg, excludeId) {
+  async webSocketMessage(ws, message) {
+    try {
+      const msg = JSON.parse(message);
+      this.broadcast(msg, ws);
+    } catch {}
+  }
+
+  async webSocketClose(ws) {
+    const att = ws.deserializeAttachment();
+    if (att) {
+      this.broadcast({ type: "left", user: att.name }, ws);
+    }
+    this.broadcastMembers(ws);
+  }
+
+  async webSocketError(ws) {
+    this.webSocketClose(ws);
+  }
+
+  broadcastMembers(excludeWs = null) {
+    const members = [];
+    for (const ws of this.state.getWebSockets()) {
+      if (ws === excludeWs || ws.readyState !== WebSocket.OPEN) continue;
+      const att = ws.deserializeAttachment();
+      if (att) members.push(att.name);
+    }
+    this.broadcast({ type: "members", members }, excludeWs);
+  }
+
+  broadcast(msg, excludeWs = null) {
     const data = JSON.stringify(msg);
-    for (const [id, session] of this.sessions) {
-      if (id !== excludeId) {
-        try { session.ws.send(data); } catch {}
-      }
+    for (const ws of this.state.getWebSockets()) {
+      if (ws === excludeWs) continue;
+      try {
+        ws.send(data);
+      } catch {}
     }
   }
 }
